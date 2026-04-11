@@ -634,17 +634,21 @@ class StreamPETRHead(AnchorFreeHead):
             outputs_class = all_cls_scores[:, :, mask_dict['pad_size']:, :]
             outputs_coord = all_bbox_preds[:, :, mask_dict['pad_size']:, :]
             mask_dict['output_known_lbs_bboxes']=(output_known_class, output_known_coord)
+            # MOTIP: expose final-layer query feature, with the dn pad stripped
+            # so it indexes match all_cls_scores / all_bbox_preds.
+            query_feat = outs_dec[-1, :, mask_dict['pad_size']:, :]
             outs = {
                 'all_cls_scores': outputs_class,
                 'all_bbox_preds': outputs_coord,
                 'dn_mask_dict':mask_dict,
-
+                'query_feat': query_feat,
             }
         else:
             outs = {
                 'all_cls_scores': all_cls_scores,
                 'all_bbox_preds': all_bbox_preds,
                 'dn_mask_dict':None,
+                'query_feat': outs_dec[-1],  # MOTIP: [B, num_q+num_propagated, C]
             }
 
         return outs

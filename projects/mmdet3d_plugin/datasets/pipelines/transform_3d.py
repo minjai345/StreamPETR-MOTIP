@@ -13,8 +13,78 @@
 import numpy as np
 import mmcv
 from mmdet.datasets.builder import PIPELINES
+from mmdet3d.datasets.pipelines import ObjectRangeFilter, ObjectNameFilter
+from mmcv.parallel import DataContainer as DC
 import torch
 from PIL import Image
+
+
+def _sync_instance_ids(results, mask_np):
+    """Apply a numpy bool mask to results['gt_instance_ids'] in place if present."""
+    ids = results.get('gt_instance_ids', None)
+    if ids is None:
+        return
+    if isinstance(ids, torch.Tensor):
+        results['gt_instance_ids'] = ids[torch.from_numpy(mask_np)]
+    else:
+        results['gt_instance_ids'] = [ids[i] for i in range(len(ids)) if mask_np[i]]
+
+
+@PIPELINES.register_module()
+class ObjectRangeFilterWithIDs(ObjectRangeFilter):
+    """ObjectRangeFilter that also filters gt_instance_ids in lock-step.
+
+    Inherits the parent's filtering logic (including the LiDAR/Depth/Camera
+    bbox-type handling and the gt_labels_3d=mask.numpy() bug fix). Recomputes
+    the same mask to apply to gt_instance_ids.
+
+    Drop-in replacement for ObjectRangeFilter when MOTIP is enabled.
+    """
+
+    def __call__(self, input_dict):
+        # Recompute the mask the parent will use, BEFORE calling super (which
+        # mutates gt_bboxes_3d). LiDAR-only assumption matches nuScenes.
+        bev_range = self.pcd_range[[0, 1, 3, 4]]
+        mask = input_dict['gt_bboxes_3d'].in_range_bev(bev_range)
+        mask_np = mask.numpy().astype(bool)
+
+        input_dict = super().__call__(input_dict)
+        _sync_instance_ids(input_dict, mask_np)
+        return input_dict
+
+
+@PIPELINES.register_module()
+class ObjectNameFilterWithIDs(ObjectNameFilter):
+    """ObjectNameFilter that also filters gt_instance_ids in lock-step."""
+
+    def __call__(self, input_dict):
+        # Replicate parent's mask computation: keep boxes whose label is in self.labels.
+        gt_labels_3d = input_dict['gt_labels_3d']
+        mask_np = np.array([n in self.labels for n in gt_labels_3d], dtype=bool)
+
+        input_dict = super().__call__(input_dict)
+        _sync_instance_ids(input_dict, mask_np)
+        return input_dict
+
+
+@PIPELINES.register_module()
+class WrapInstanceIDs(object):
+    """Wrap gt_instance_ids in a DataContainer so mmcv collate handles
+    variable-length tensors as a list (cpu_only) instead of trying to stack.
+
+    Place right before Collect3D in the pipeline.
+    """
+
+    def __call__(self, results):
+        ids = results.get('gt_instance_ids', None)
+        if ids is None:
+            return results
+        if isinstance(ids, DC):
+            return results
+        if not isinstance(ids, torch.Tensor):
+            ids = torch.tensor(list(ids), dtype=torch.long)
+        results['gt_instance_ids'] = DC(ids, cpu_only=True)
+        return results
 
 
 @PIPELINES.register_module()

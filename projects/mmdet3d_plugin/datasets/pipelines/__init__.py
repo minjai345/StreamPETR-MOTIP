@@ -3,6 +3,9 @@ from .transform_3d import(
     NormalizeMultiviewImage,
     ResizeCropFlipRotImage,
     GlobalRotScaleTransImage,
+    ObjectRangeFilterWithIDs,
+    ObjectNameFilterWithIDs,
+    WrapInstanceIDs,
 )
 
 from .formating import(

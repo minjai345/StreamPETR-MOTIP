@@ -228,7 +228,7 @@ class CustomNuScenesDataset(NuScenesDataset):
                 ))
         if not self.test_mode:
             annos = self.get_ann_info(index)
-            annos.update( 
+            annos.update(
                 dict(
                     bboxes=info['bboxes2d'],
                     labels=info['labels2d'],
@@ -237,8 +237,60 @@ class CustomNuScenesDataset(NuScenesDataset):
                     bboxes_ignore=info['bboxes_ignore'])
             )
             input_dict['ann_info'] = annos
-            
+            # MOTIP: expose gt_instance_ids at top-level so pipeline transforms
+            # can sync filtering without going through LoadAnnotations3D.
+            input_dict['gt_instance_ids'] = annos.get(
+                'gt_instance_ids', torch.zeros(0, dtype=torch.long))
+
         return input_dict
+
+    def get_ann_info(self, index):
+        """MOTIP-aware annotation: add gt_instance_ids alongside boxes/labels.
+
+        Calls the parent NuScenesDataset.get_ann_info, then converts the raw
+        info's `instance_tokens` (string per-detection) to integer IDs that
+        persist across calls (so the same instance gets the same int ID
+        whenever it reappears in subsequent frames).
+
+        The same valid_flag mask the parent applies is replicated here so the
+        ID list stays index-aligned with gt_bboxes_3d/gt_labels_3d.
+
+        If `instance_tokens` is missing from the pkl, returns an empty tensor;
+        downstream MOTIP code skips id loss when len == 0.
+
+        Caveats:
+        - `_instance_token_map` is per-dataset-instance. With DataLoader
+          workers > 0, each worker has its own map → an instance gets a
+          different int per worker. This is fine because MOTIP only needs
+          intra-clip ID consistency, and one worker handles a whole clip.
+        - Under DDP, ranks have independent maps too. Same reasoning applies.
+        """
+        ann_info = super().get_ann_info(index)
+        info = self.data_infos[index]
+        instance_tokens = info.get('instance_tokens', None)
+
+        if instance_tokens is None:
+            ann_info['gt_instance_ids'] = torch.zeros(0, dtype=torch.long)
+            return ann_info
+
+        if not hasattr(self, '_instance_token_map'):
+            self._instance_token_map = {}
+
+        instance_ids = []
+        for token in instance_tokens:
+            if token not in self._instance_token_map:
+                self._instance_token_map[token] = len(self._instance_token_map)
+            instance_ids.append(self._instance_token_map[token])
+
+        # Replicate the parent's mask (use_valid_flag or num_lidar_pts > 0)
+        if self.use_valid_flag:
+            mask = info['valid_flag']
+        else:
+            mask = info['num_lidar_pts'] > 0
+        instance_ids = [instance_ids[i] for i in range(len(instance_ids)) if mask[i]]
+
+        ann_info['gt_instance_ids'] = torch.tensor(instance_ids, dtype=torch.long)
+        return ann_info
 
 
     def __getitem__(self, idx):
