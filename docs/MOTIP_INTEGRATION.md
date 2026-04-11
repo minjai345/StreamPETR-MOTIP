@@ -1,0 +1,357 @@
+# StreamPETR + MOTIP Integration
+
+SparseBEV+MOTIP 코드를 StreamPETR detector로 옮기기 위한 통합 작업 기록.
+
+---
+
+## Why StreamPETR
+
+기존 SparseBEV+MOTIP 구현은 학습 시 CPU bottleneck이 심함:
+
+```
+clip_len × num_cameras × (1 + sweeps_num) × per_image_cost
+   4     ×       6     ×     (1 + 7)      = 192 images per sample
+```
+
+- SparseBEV: keyframe당 7 sweeps을 디스크에서 로드 → temporal model 입력
+- MOTIP: clip 단위 학습 (clip_len=4)
+- 두 시간축이 곱해져서 polynomial하게 폭발
+
+→ StreamPETR로 갈아타면 sweeps 없이 query memory propagation으로 시간 정보 처리. **per-sample I/O가 1/8 수준** (192 → 24).
+
+---
+
+## 환경 호환성
+
+### 사용 환경
+
+| 항목 | 버전 |
+|------|------|
+| Python | 3.8 |
+| CUDA | 11.8 |
+| PyTorch | 2.0.0+cu118 |
+| mmcv-full | 1.7.0 (custom build at /tmp/mmcv) |
+| mmdet | 2.28.2 |
+| mmdet3d | 1.0.0rc6 |
+| GPU | RTX 4090 (sm_89, PTX JIT fallback) |
+
+`sparsebev` conda env 그대로 사용 (`/data4/minjae/miniforge3/envs/sparsebev`).
+
+### 환경 변수
+
+```bash
+LD_LIBRARY_PATH=/data4/minjae/miniforge3/envs/sparsebev/lib:$LD_LIBRARY_PATH
+PYTHONPATH=/data4/minjae/workspace/StreamPETR:$PYTHONPATH
+```
+
+`LD_LIBRARY_PATH`는 conda env의 새 libstdc++을 시스템 것보다 우선시키기 위함 (GLIBCXX_3.4.29 필요).
+
+---
+
+## 환경 셋업 수정사항
+
+### 1. mmdetection3d configs symlink
+
+StreamPETR base config가 `../../../mmdetection3d/configs/_base_/...`를 참조하지만 사용자가 mmdetection3d를 clone하지 않음. mmdet3d 패키지의 `.mim/configs`를 symlink로 연결:
+
+```bash
+ln -s /data4/minjae/miniforge3/envs/sparsebev/lib/python3.8/site-packages/mmdet3d/.mim \
+      /data4/minjae/workspace/StreamPETR/mmdetection3d
+```
+
+### 2. flash-attn 우회 (옵션 2-A)
+
+`flash_attn` 라이브러리는 설치하지 않음. 대신 import를 try/except로 감쌈.
+
+**파일**: `projects/mmdet3d_plugin/models/utils/attention.py`
+**라인**: 21-30 (원본의 21-22 두 줄을 try 블록으로 확장)
+
+```python
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+    _HAS_FLASH = True
+except ImportError:
+    _HAS_FLASH = False
+    flash_attn_unpadded_kvpacked_func = None
+    unpad_input = pad_input = index_first_axis = None
+```
+
+이렇게 해두면 `attention.py`가 import는 통과하지만 `FlashAttention`/`FlashMHA` 클래스를 instantiate하면 NameError. R50 config에서 `PETRMultiheadFlashAttention` → `PETRMultiheadAttention`으로 교체해서 instantiate를 피함.
+
+근거: maintainer 공식 답변 (https://github.com/exiawsh/StreamPETR/issues/23). flash-attn은 "optional"이지만 해제하려면 import도 같이 손봐야 함.
+
+### 3. 디버그 leftover 제거
+
+**파일**: `projects/mmdet3d_plugin/datasets/samplers/group_sampler.py`
+**라인**: 18
+
+```python
+# from IPython import embed  # disabled: debug-only, IPython not installed
+```
+
+---
+
+## Non-flash override config
+
+기존 60e R50 config의 attention만 교체한 override config:
+
+`projects/configs/StreamPETR/stream_petr_r50_noflash_704_bs2_seq_428q_nui_60e.py`:
+
+```python
+_base_ = ['./stream_petr_r50_flash_704_bs2_seq_428q_nui_60e.py']
+
+model = dict(
+    pts_bbox_head=dict(
+        transformer=dict(
+            decoder=dict(
+                transformerlayers=dict(
+                    attn_cfgs=[
+                        dict(type='MultiheadAttention',
+                             embed_dims=256, num_heads=8, dropout=0.1),
+                        dict(type='PETRMultiheadAttention',  # ← was PETRMultiheadFlashAttention
+                             embed_dims=256, num_heads=8, dropout=0.1),
+                    ],
+                ),
+            ),
+        ),
+    ),
+)
+```
+
+`PETRMultiheadAttention`은 동일 layout (in_proj_weight, out_proj.*)을 사용해서 60e 체크포인트가 그대로 load됨.
+
+---
+
+## 검증 결과
+
+### Forward pass on val[0]
+
+```
+Total params: 37.26 M
+Checkpoint loaded.
+all_cls_scores: (6, 1, 428, 10)
+all_bbox_preds: (6, 1, 428, 10)
+top-5 scores: [0.94, 0.84, 0.28, 0.26, 0.23]
+```
+
+- non-flash 변환이 수치적으로 정상 (top score 합리적)
+- 6 decoder layer, 428 query (300 base + 128 propagated), 10 class
+- num_propagated=128로 인해 query 수가 num_query보다 큰 게 정상
+
+---
+
+## StreamPETR 시간 메커니즘 (MOTIP과의 관계)
+
+### Head 내부 메모리
+
+`StreamPETRHead`는 자체 memory bank를 운영:
+
+| 변수 | 역할 |
+|------|------|
+| `memory_embedding` | 과거 query feature [B, 512, C] |
+| `memory_reference_point` | 과거 query 위치 [B, 512, 3] |
+| `memory_egopose` | 과거 query의 ego pose [B, 512, 4, 4] |
+| `memory_velo` | 과거 query 속도 |
+| `memory_timestamp` | 시간 정보 |
+
+매 frame:
+1. **`pre_update_memory`**: 이전 메모리를 현재 ego pose 좌표계로 변환 + scene boundary 시 reset (`prev_exists=0`)
+2. **`temporal_alignment`**: 메모리 앞 128개를 새 query 300개와 concat → 428개 query
+3. Decoder forward → cls/bbox 예측
+4. **`post_update_memory`**: 현재 frame의 top-128 query를 다시 메모리에 push (`.detach()` — gradient 안 흐름)
+
+### MOTIP과의 컨셉 비교
+
+| 항목 | StreamPETR memory | MOTIP tracklet buffer |
+|------|-------------------|-----------------------|
+| 저장 단위 | top-128 query (score 기준) | matched detection (Hungarian 기준) |
+| 사용 목적 | 다음 frame **detection** 품질 | frame 간 **ID 매칭** |
+| 길이 | memory_len=512 | context_len=5 |
+| Identity 추적 | ❌ implicit | ✅ explicit ID |
+| Detach | ✅ | ✅ |
+| 좌표 변환 | 매 frame `ego_pose` 기반 | 매 frame `lidar2global` 기반 |
+
+**좌표 변환은 변수명만 다름**. StreamPETR의 `ego_pose`는 실제로는 `e2g @ l2e = lidar2global` (`nuscenes_dataset.py:176`). 동일 행렬, 동일 의미.
+
+→ 두 시스템은 **충돌하지 않고 보완적**. 같은 query feature를 두 가지 목적으로 사용 가능.
+
+---
+
+## 통합 전략: A (MOTIP buffer를 별도 운영)
+
+- StreamPETR head memory는 detection용으로 그대로 유지
+- MOTIP은 자체 tracklet buffer 운영 (SparseBEV+MOTIP 코드 거의 100% 재사용)
+- 두 시스템 독립 → 디버깅 쉬움
+
+### Query 적용 범위: 1-A (새 300개만)
+
+- `outs_dec[-1][:, :300]` 만 MOTIP의 query feature로 사용
+- propagated 128개는 StreamPETR이 implicit하게 propagate
+- 새 300개는 MOTIP이 explicit ID assignment
+
+---
+
+## 작업 단계
+
+각 단계 후 검증.
+
+### Step 1: 데이터 준비 ✅
+
+**새 파일**: `tools/prepare_motip_pkl.py` (전체 신규)
+
+- SparseBEV pkl (`nuscenes_infos_*_sweep.pkl`)의 `instance_tokens` 필드를 StreamPETR pkl (`nuscenes2d_temporal_infos_*.pkl`)로 token 매칭으로 복사
+- 사전 검증: token 28130/28130 일치, gt_boxes 내용까지 binary 일치 → 인덱스 그대로 복사 가능
+- **결과**: train 28130/28130, val 6019/6019 모두 성공 (skipped/mismatch 0)
+- 출력 파일 (원본 보존):
+  - `data/nuscenes/nuscenes2d_temporal_infos_train_motip.pkl`
+  - `data/nuscenes/nuscenes2d_temporal_infos_val_motip.pkl`
+
+### Step 2: Dataset 클래스 수정 ✅
+
+**파일**: `projects/mmdet3d_plugin/datasets/nuscenes_dataset.py`
+
+**수정 1**: `get_data_info` 안에서 `gt_instance_ids`를 top-level로 노출
+**라인**: 240-243 (기존 `input_dict['ann_info'] = annos` 다음에 추가)
+
+```python
+# MOTIP: expose gt_instance_ids at top-level so pipeline transforms
+# can sync filtering without going through LoadAnnotations3D.
+input_dict['gt_instance_ids'] = annos.get(
+    'gt_instance_ids', torch.zeros(0, dtype=torch.long))
+```
+
+**수정 2**: `get_ann_info` 메서드 새로 override (부모 NuScenesDataset의 메서드 확장)
+**라인**: 247-293 (새 메서드, 약 47줄)
+
+- 부모 클래스의 ann_info에 `gt_instance_ids` 추가
+- `_instance_token_map` (per-dataset-instance) 으로 string token → int ID 변환
+- 부모와 동일한 valid_flag mask 적용 (인덱스 정렬 보존)
+- instance_tokens 없으면 빈 텐서 반환 (downstream에서 안전하게 skip)
+
+**검증**: sample 0/1 (같은 scene)이 동일한 첫 5개 ID `[0, 1, 2, 3, 4]` — frame 간 ID 일관성 OK
+
+**주의**: DataLoader worker별, DDP rank별로 `_instance_token_map`이 독립적. 한 worker가 한 clip을 처리한다는 가정 하에서만 안전.
+
+### Step 3: Pipeline transforms 추가 ✅
+
+**파일**: `projects/mmdet3d_plugin/datasets/pipelines/transform_3d.py`
+
+**수정 1**: import 추가
+**라인**: 13-18 (기존 import 블록 확장)
+```python
+from mmdet3d.datasets.pipelines import ObjectRangeFilter, ObjectNameFilter
+from mmcv.parallel import DataContainer as DC
+```
+
+**수정 2**: 헬퍼 함수 + 새 클래스 3개
+**라인**: 22-86 (전체 신규, 약 65줄)
+
+- `_sync_instance_ids(results, mask_np)` — line 22 — 마스크를 gt_instance_ids에 in-place로 적용
+- `class ObjectRangeFilterWithIDs(ObjectRangeFilter)` — line 34 — range filter + ID 동기화 (mmdet3d 본가 상속)
+- `class ObjectNameFilterWithIDs(ObjectNameFilter)` — line 57 — name filter + ID 동기화 (mmdet3d 본가 상속)
+- `class WrapInstanceIDs` — line 71 — DataContainer로 wrap (variable-length tensor 처리)
+
+mmdet3d 본가 클래스를 상속한 이유: DRY + 미래 mmdet3d 버그 픽스 자동 흡수.
+
+**파일**: `projects/mmdet3d_plugin/datasets/pipelines/__init__.py`
+**라인**: 1-9 (기존 import 블록에 3개 export 추가)
+
+```python
+from .transform_3d import(
+    PadMultiViewImage,
+    NormalizeMultiviewImage,
+    ResizeCropFlipRotImage,
+    GlobalRotScaleTransImage,
+    ObjectRangeFilterWithIDs,    # ← MOTIP
+    ObjectNameFilterWithIDs,     # ← MOTIP
+    WrapInstanceIDs,             # ← MOTIP
+)
+```
+
+**검증**: sample 0 (44 boxes) → filter 후 41 boxes / 41 IDs, 모든 sample에서 `box count == id count`
+
+### Step 4: Head에 query_feat 노출 ✅
+
+**파일**: `projects/mmdet3d_plugin/models/dense_heads/streampetr_head.py`
+**라인**: 631-652 (기존 outs dict 분기 두 곳 모두 수정)
+
+**train mode (denoising padding이 있는 경우)** — 라인 637-645:
+```python
+# MOTIP: expose final-layer query feature, with the dn pad stripped
+# so it indexes match all_cls_scores / all_bbox_preds.
+query_feat = outs_dec[-1, :, mask_dict['pad_size']:, :]
+outs = {
+    'all_cls_scores': outputs_class,
+    'all_bbox_preds': outputs_coord,
+    'dn_mask_dict': mask_dict,
+    'query_feat': query_feat,
+}
+```
+
+**eval mode (dn_mask_dict=None)** — 라인 647-652:
+```python
+outs = {
+    'all_cls_scores': all_cls_scores,
+    'all_bbox_preds': all_bbox_preds,
+    'dn_mask_dict': None,
+    'query_feat': outs_dec[-1],  # MOTIP: [B, num_q+num_propagated, C]
+}
+```
+
+**중요**: train 모드에서 outs_dec 앞부분에 denoising query가 padding으로 붙어있음. cls/bbox는 이미 잘라내고 있는데, query_feat도 같은 처리를 안 하면 인덱스 미스매치 발생.
+
+- **검증**: forward 1 sample → `query_feat: (1, 428, 256)` 정확
+- 동일 sample의 top-5 score는 변경 전후 동일 (read-only 노출 확인)
+
+### Step 5: MOTIP 모듈 drop-in
+- SparseBEV의 `models/motip/` 그대로 복사:
+  - id_dictionary.py
+  - tracklet.py
+  - augmentation.py
+  - pos_encoding.py
+
+### Step 6: Petr3D detector에 MOTIP loss 통합
+- `compute_id_loss` 메서드 추가 (SparseBEV에서 적응)
+- 결정 1-A: `query_feat[:, :300]` 만 사용
+- `forward_train` 마지막에서 호출
+
+### Step 7: Config 작성
+- `stream_petr_r50_motip_704_bs2_seq_24e.py`
+- 60e checkpoint를 detector init으로 load
+- MOTIP cfg + 학습 setting
+
+### Step 8: 1 iteration 검증
+- Single GPU forward + backward
+- 모든 loss finite, gradient nan/inf 없음
+
+---
+
+## 파일 변경 위치 요약
+
+```
+StreamPETR/
+├── docs/MOTIP_INTEGRATION.md                  ← 이 문서
+├── mmdetection3d                              ← symlink (셋업)
+├── tools/prepare_motip_pkl.py                 ← Step 1 (새 파일)
+├── tools/verify_motip_compat.py               ← 환경 검증용 (존재)
+├── projects/configs/StreamPETR/
+│   ├── stream_petr_r50_noflash_*.py           ← non-flash override (존재)
+│   └── stream_petr_r50_motip_*.py             ← MOTIP config (Step 7)
+├── projects/mmdet3d_plugin/
+│   ├── models/motip/                          ← Step 5 (새 폴더)
+│   ├── models/dense_heads/streampetr_head.py  ← Step 4 (1줄)
+│   ├── models/detectors/petr3d.py             ← Step 6
+│   ├── models/utils/attention.py              ← 셋업 (try/except, 완료)
+│   ├── datasets/nuscenes_dataset.py           ← Step 2
+│   ├── datasets/pipelines/transform_3d.py     ← Step 3
+│   └── datasets/samplers/group_sampler.py     ← 셋업 (IPython 주석, 완료)
+```
+
+---
+
+## 미해결 / 후속 작업
+
+1. **Full eval로 mAP/NDS 재현 검증** — 아직 미실행 (~30~40분 소요, GPU 0,1 동시 사용 시)
+2. **flash-attn 설치** — 본 학습 단계에서 속도/메모리 손해를 줄이려면 시도 가치 있음. PyTorch 2.0의 `scaled_dot_product_attention`으로 attention.py 교체하는 게 안전한 대안.
+3. **CPU contention** — 다른 사용자의 학습 프로세스로 시스템 load average 50+. 우리는 GPU 0,1만 사용 + workers_per_gpu 최소화로 매너 유지.
