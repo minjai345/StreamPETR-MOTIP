@@ -304,12 +304,32 @@ outs = {
 - **검증**: forward 1 sample → `query_feat: (1, 428, 256)` 정확
 - 동일 sample의 top-5 score는 변경 전후 동일 (read-only 노출 확인)
 
-### Step 5: MOTIP 모듈 drop-in
-- SparseBEV의 `models/motip/` 그대로 복사:
-  - id_dictionary.py
-  - tracklet.py
-  - augmentation.py
-  - pos_encoding.py
+### Step 5: MOTIP 모듈 drop-in ✅
+
+**새 폴더**: `projects/mmdet3d_plugin/models/motip/`
+
+SparseBEV의 `models/motip/` 5개 파일을 복사 + 두 가지 cleanup:
+
+| 파일 | 변경 | 내용 |
+|------|------|------|
+| `id_dictionary.py` | 그대로 | `IDDictionary` — K+1 learnable embeddings (K id + newborn) |
+| `id_decoder.py` | tracker.py에서 rename | `IDDecoder` — `nn.TransformerDecoder` + `nn.Linear(d, K+1)` |
+| `tracklet.py` | docstring 보강 | `TrackletFormer` — `concat([obj, pe, id])` → 3C token |
+| `pos_encoding.py` | docstring 보강 | `Positional3DEncoding` — bbox+velo → C MLP (이름과 달리 sinusoidal 아님) |
+| `__init__.py` | rewrite | 4개 클래스 re-export, `__all__` 명시 |
+| `augmentation.py` | **삭제** | dead code (SparseBEV `compute_id_loss`가 inline 구현, 이 함수 호출 안 함) |
+
+**검토했지만 그대로 둔 것**:
+- `TrackletFormer.temporal_embed` — SparseBEV가 `rel_timestep`을 안 넘기므로 unused parameter. 향후 SparseBEV-trained 체크포인트 호환성 위해 유지. TODO 주석.
+
+**검증** — 모든 모듈 instantiate + 1 forward pass 성공:
+```
+pe shape:        (10, 256)
+spec shape:      (10, 256)
+queries shape:   (1, 10, 768)
+context shape:   (1, 30, 768)
+logits shape:    (1, 10, 51)   ✓ (K=50 + 1 newborn)
+```
 
 ### Step 6: Petr3D detector에 MOTIP loss 통합
 - `compute_id_loss` 메서드 추가 (SparseBEV에서 적응)
