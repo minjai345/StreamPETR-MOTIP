@@ -95,8 +95,8 @@ train_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=2,
+    samples_per_gpu=4,    # was 1; ~8 GB VRAM at this size, well under 24 GB
+    workers_per_gpu=4,    # match samples_per_gpu so workers can keep up
     train=dict(
         ann_file='data/nuscenes/nuscenes2d_temporal_infos_train_motip.pkl',
         seq_mode=False,           # disable streaming, switch to sliding window
@@ -132,12 +132,12 @@ optimizer = dict(
 # Load pretrained detector weights
 load_from = 'ckpts/stream_petr_r50_flash_704_bs2_seq_428q_nui_60e.pth'
 
-# Recompute training schedule for our 2-GPU, samples_per_gpu=1 setup.
+# Recompute training schedule for our 2-GPU, samples_per_gpu=4 setup.
 # Base config assumed num_gpus=8, batch_size=2 → its inherited max_iters
-# would only run a fraction of an epoch under our smaller effective batch.
+# would not match our effective batch.
 num_gpus = 2
-batch_size = 1
-num_iters_per_epoch = 28130 // (num_gpus * batch_size)  # 14065
+batch_size = 4  # samples_per_gpu
+num_iters_per_epoch = 28130 // (num_gpus * batch_size)  # 3516
 num_epochs = 6  # Phase 1: detector frozen, only MOTIP submodules learn
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
@@ -150,3 +150,33 @@ evaluation = dict(interval=num_iters_per_epoch * num_epochs)  # only at the end
 # tracklet_former.temporal_embed has been removed entirely (it was dead
 # code, see motip/tracklet.py).
 find_unused_parameters = False
+
+# ── Logging: text + tensorboard + wandb ──
+log_config = dict(
+    interval=50,
+    hooks=[
+        dict(type='TextLoggerHook'),
+        dict(type='TensorboardLoggerHook'),
+        dict(type='WandbLoggerHook',
+             init_kwargs=dict(
+                 project='StreamPETR-MOTIP',
+                 name='phase1_8key_freeze_spg4',
+                 config=dict(
+                     phase='phase1_freeze',
+                     architecture='r50_428q_nui',
+                     queue_length=queue_length,
+                     num_frame_losses=num_frame_losses,
+                     num_epochs=num_epochs,
+                     num_gpus=num_gpus,
+                     batch_size=batch_size,
+                     freeze_detector=True,
+                     motip_num_ids=motip_cfg['num_ids'],
+                     motip_embed_dim=motip_cfg['embed_dim'],
+                     motip_decoder_layers=motip_cfg['id_decoder_layers'],
+                     motip_id_loss_weight=motip_cfg['id_loss_weight'],
+                 ),
+             ),
+             interval=50,
+             commit=True,
+             by_epoch=False),
+    ])
