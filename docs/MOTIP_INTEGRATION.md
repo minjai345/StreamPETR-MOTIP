@@ -184,11 +184,17 @@ top-5 scores: [0.94, 0.84, 0.28, 0.26, 0.23]
 - MOTIP은 자체 tracklet buffer 운영 (SparseBEV+MOTIP 코드 거의 100% 재사용)
 - 두 시스템 독립 → 디버깅 쉬움
 
-### Query 적용 범위: 1-A (새 300개만)
+### Query 적용 범위: 1-B (전체 428 query 사용) — 1-A에서 변경됨
 
-- `outs_dec[-1][:, :300]` 만 MOTIP의 query feature로 사용
-- propagated 128개는 StreamPETR이 implicit하게 propagate
-- 새 300개는 MOTIP이 explicit ID assignment
+처음에는 결정 1-A (새 300개만) 로 가려 했으나, 다음 사실을 인지하면서 1-B로 변경:
+
+- Hungarian matching의 매칭 수는 query 수가 아니라 **GT 수에 bound** (한 frame ~50개 GT). 즉 300이든 428이든 실제 학습 sample 수는 동일.
+- 차이는 "어떤 query가 매칭되는가". 428을 쓰면 이전 frame에서 잘 track되고 있는 GT는 propagated query와 매칭됨 → MOTIP이 "propagated query에 대해 persistent ID 예측"을 학습. **이건 우리가 원하는 신호**.
+- propagated query는 `head.memory_embedding`에서 `.detach()`되어 가져옴 + 현재 frame decoder가 한 번 더 cross-attention으로 update. 따라서 e2e 모드에서도 gradient는 현재 frame decoder까지 정상 flow (이전 frame까지는 끊어짐, StreamPETR의 의도된 설계).
+
+→ **`outs['query_feat']` 전체 (1, 428, C)를 그대로 MOTIP에 사용**.
+
+Hungarian matching은 검출기와 동일하게 428 전체에서 수행. 필터링/슬라이싱 없음.
 
 ---
 
@@ -331,19 +337,91 @@ context shape:   (1, 30, 768)
 logits shape:    (1, 10, 51)   ✓ (K=50 + 1 newborn)
 ```
 
-### Step 6: Petr3D detector에 MOTIP loss 통합
-- `compute_id_loss` 메서드 추가 (SparseBEV에서 적응)
-- 결정 1-A: `query_feat[:, :300]` 만 사용
-- `forward_train` 마지막에서 호출
+### Step 6: Petr3D detector에 MOTIP loss 통합 ✅
 
-### Step 7: Config 작성
-- `stream_petr_r50_motip_704_bs2_seq_24e.py`
-- 60e checkpoint를 detector init으로 load
-- MOTIP cfg + 학습 setting
+**파일**: `projects/mmdet3d_plugin/models/detectors/petr3d.py`
 
-### Step 8: 1 iteration 검증
-- Single GPU forward + backward
-- 모든 loss finite, gradient nan/inf 없음
+**변경 내역**:
+
+1. **import + `__init__`** (라인 17-19, 47, 64-83)
+   - `IDDictionary`, `IDDecoder`, `Positional3DEncoding`, `TrackletFormer` import
+   - `motip_cfg` 파라미터 추가
+   - 4개 MOTIP submodule을 conditional로 instantiate (`motip_cfg=None`이면 기존 Petr3D와 동일)
+   - `freeze_detector`, `id_loss_weight`, `context_len` flag 저장
+
+2. **`forward_pts_train`** (라인 222-225)
+   - head outs를 `self._motip_last_outs`에 cache (per-frame)
+
+3. **`obtain_history_memory`** (라인 138, 149-152, 173-181)
+   - `gt_instance_ids` 파라미터 추가
+   - 매 frame loop마다 motip data (outs, gt, ego_pose, prev_exists)를 collect
+   - clip 끝나면 `self._motip_frame_data`에 저장
+
+4. **`forward`** (라인 273-282)
+   - `gt_instance_ids` key가 있으면 transpose 처리에 추가
+
+5. **`forward_train`** (라인 294, 348-353)
+   - `gt_instance_ids` 파라미터 받기
+   - obtain_history_memory 후 `compute_id_loss(self._motip_frame_data)` 호출
+   - 결과를 losses dict에 update
+
+6. **MOTIP helper 메서드 + `compute_id_loss`** (라인 363-555, 약 200줄, 새 메서드)
+   - `_bbox_to_pe_input`: 10-dim StreamPETR bbox → 9-dim PE 입력
+   - `_transform_bbox_to_current`: 좌표 변환 (이전 frame → 현재 frame lidar coord)
+   - `compute_id_loss`: clip 단위 ID loss 계산
+     - Step 1: 매 (b, t)마다 Hungarian matching → matched feat/bbox/raw_id
+     - Step 2: clip 전체 ID re-indexing + random permutation augmentation
+     - Step 3: 각 target frame t (1..T-1)에 대해 context (frames 0..t-1) 구성
+       - 좌표 변환 + PE_3D + tracklet_former
+       - Trajectory augmentation (occlusion + switch)
+     - Step 4: ID prediction + cross-entropy loss
+   - **결정 1-B 적용**: 전체 428 query 사용 (slicing 없음)
+   - **SparseBEV 코드의 perf bug 두 가지 고침**: Python loop in torch.where → torch.isin 사용, GPU↔CPU sync 최소화
+
+**검증**: queue_length=8 sliding window 학습 모드로 1 iteration:
+```
+loss_id:       4.0615  (finite ✓)   ← ≈ ln(51) random baseline
+id_acc:        0.0209  (finite ✓)   ← ≈ 1/51 random
+num_matched:   41.0000              ← Hungarian이 41개 GT 매칭
+MOTIP grad:    115/116               ← temporal_embed (unused) 빼고 다 흐름
+```
+
+**주의**: `tracklet_former.temporal_embed.weight`는 unused (rel_timestep을 안 넘김) → DDP 학습 시 `find_unused_parameters=True` 필요.
+
+### Step 7: Config 작성 ✅
+
+**새 파일**: `projects/configs/StreamPETR/stream_petr_r50_motip_704_bs1_8key_24e.py`
+
+base는 non-flash 60e config (architecture: 428q + NuImg pretrain). MOTIP을 위해 sliding window 학습 모드로 override:
+
+| 항목 | base (60e seq) | 우리 (motip sliding) |
+|------|----------------|----------------------|
+| seq_mode | True | **False** |
+| queue_length | 1 | **8** |
+| num_frame_losses | 1 | **2** |
+| num_frame_head_grads | 1 | **2** |
+| num_frame_backbone_grads | 1 | **2** |
+| seq_split_num | 2 | **1** |
+| shuffler_sampler | InfiniteGroupEachSampleInBatchSampler | **DistributedGroupSampler** |
+| samples_per_gpu | 2 | **1** |
+| ann_file | *_train.pkl | **_train_motip.pkl** |
+| pipeline | base | **WithIDs filters + WrapInstanceIDs + gt_instance_ids in keys** |
+| optimizer.lr_mult | normal | **detector lr_mult=0 (frozen)** |
+| load_from | None | **60e ckpt** |
+
+motip_cfg: `freeze_detector=True` (Phase 1)
+
+### Step 8: 1 iteration 검증 ✅
+
+**새 파일**: `tools/verify_motip_train_step.py`
+
+전체 파이프라인을 한 번에 검증:
+1. dataset+pipeline build → gt_instance_ids 정상 흐름
+2. model build + 60e ckpt load (MOTIP keys만 missing)
+3. 1 batch forward → detection loss + id_loss 모두 finite
+4. backward → gradient finite, MOTIP submodules에 흐름
+
+결과는 위 Step 6 검증 결과 표 참조.
 
 ---
 
