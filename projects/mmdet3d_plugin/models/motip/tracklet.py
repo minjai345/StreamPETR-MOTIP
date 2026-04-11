@@ -1,29 +1,28 @@
 import torch
 import torch.nn as nn
 
-class TrackletFormer(nn.Module):
-    """τ = concat(f_obj, PE_3D, i_k) + TE(Δt)  →  [N, 3C].
 
-    NOTE: SparseBEV's compute_id_loss never passes `rel_timestep`, so
-    `temporal_embed` currently sits as an unused (but allocated) parameter.
-    Left in place for now to avoid breaking checkpoint compatibility with
-    SparseBEV-trained MOTIP weights. Drop it once we know we won't reuse
-    those weights.
+class TrackletFormer(nn.Module):
+    """τ = concat(f_obj, PE_3D, i_k)  →  [N, 3C].
+
+    Originally there was a `temporal_embed` nn.Embedding here, conditional
+    on a `rel_timestep` argument that nothing actually passes. With DDP +
+    `find_unused_parameters=False` (required by gradient checkpointing in
+    StreamPETR's head), an unused parameter raises an error, so we drop it
+    entirely. If a temporal embedding is needed in the future, re-add it
+    behind a config flag and route `rel_timestep` through compute_id_loss.
     """
     def __init__(self, embed_dim=256, max_temporal=20):
         super().__init__()
         self.embed_dim = embed_dim
-        self.temporal_embed = nn.Embedding(max_temporal, 3 * embed_dim)
+        # max_temporal kept in the signature for backwards-compatible config
 
     def form_tracklet(self, obj_embedding, pe_3d, id_embedding, rel_timestep=None):
         """
-        obj_embedding: [N, C]  — SparseBEV query output
-        pe_3d: [N, C]          — 3D positional encoding
-        id_embedding: [N, C]   — ID dictionary embedding
-        rel_timestep: [N]      — 현재 frame 대비 상대 offset
-        Returns: [N, 3C=768]
+        obj_embedding: [N, C]
+        pe_3d: [N, C]
+        id_embedding: [N, C]
+        rel_timestep: kept for API compatibility but currently ignored.
+        Returns: [N, 3C]
         """
-        tracklet = torch.cat([obj_embedding, pe_3d, id_embedding], dim=-1)
-        if rel_timestep is not None:
-            tracklet = tracklet + self.temporal_embed(rel_timestep)
-        return tracklet
+        return torch.cat([obj_embedding, pe_3d, id_embedding], dim=-1)

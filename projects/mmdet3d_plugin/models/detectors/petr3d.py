@@ -86,6 +86,20 @@ class Petr3D(MVXTwoStageDetector):
             self.context_len = motip_cfg.get('context_len', 5)
             self._tracklet_buffers = {}  # per-batch-slot history buffer
 
+            # Hard-freeze the detector via requires_grad=False (not just
+            # lr_mult=0 in the optimizer). Without this, autograd would
+            # still compute grads for the detector's params on every
+            # backward, and the head's gradient-checkpointed decoder layer
+            # would do reentrant recompute that fires DDP's "marked ready
+            # twice" check (with multiple frames-with-grad in the
+            # sliding-window training loop).
+            if self.freeze_detector:
+                _motip_prefixes = ('id_dict.', 'pe_3d.', 'tracklet_former.',
+                                   'id_decoder.')
+                for name, param in self.named_parameters():
+                    if not name.startswith(_motip_prefixes):
+                        param.requires_grad = False
+
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
         """Extract features of images."""

@@ -141,6 +141,15 @@ class CustomNuScenesDataset(NuScenesDataset):
                     queue[-1][key] = DC([each[key].data for each in queue], cpu_only=True)
                 else:
                     queue[-1][key] = DC([each[key].data for each in queue], cpu_only=False)
+            # MOTIP: gt_instance_ids is per-detection variable-length, so it
+            # has to be passed as a per-frame list (not stacked). Only emit
+            # it when the field is actually present in each frame's data.
+            if 'gt_instance_ids' in queue[0]:
+                queue[-1]['gt_instance_ids'] = DC(
+                    [each['gt_instance_ids'].data if hasattr(each['gt_instance_ids'], 'data')
+                     else each['gt_instance_ids'] for each in queue],
+                    cpu_only=True,
+                )
 
         queue = queue[-1]
         return queue

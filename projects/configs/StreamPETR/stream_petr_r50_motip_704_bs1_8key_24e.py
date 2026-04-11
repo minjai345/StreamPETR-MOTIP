@@ -104,7 +104,10 @@ data = dict(
         num_frame_losses=num_frame_losses,
         queue_length=queue_length,
         pipeline=train_pipeline,
-        collect_keys=collect_keys + ['img', 'prev_exists', 'img_metas', 'gt_instance_ids'],
+        # gt_instance_ids is variable-length (per-detection), so it must NOT
+        # be in collect_keys (which torch.stacks across the queue). It is
+        # handled by union2one's hardcoded list as a per-frame DC list.
+        collect_keys=collect_keys + ['img', 'prev_exists', 'img_metas'],
     ),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
 )
@@ -129,6 +132,21 @@ optimizer = dict(
 # Load pretrained detector weights
 load_from = 'ckpts/stream_petr_r50_flash_704_bs2_seq_428q_nui_60e.pth'
 
-# Phase 1 is short — id loss converges quickly relative to detection
-total_epochs = 12
-runner = dict(type='IterBasedRunner', max_iters=12 * (28130 // 1))  # placeholder; mmcv recomputes
+# Recompute training schedule for our 2-GPU, samples_per_gpu=1 setup.
+# Base config assumed num_gpus=8, batch_size=2 → its inherited max_iters
+# would only run a fraction of an epoch under our smaller effective batch.
+num_gpus = 2
+batch_size = 1
+num_iters_per_epoch = 28130 // (num_gpus * batch_size)  # 14065
+num_epochs = 6  # Phase 1: detector frozen, only MOTIP submodules learn
+runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
+evaluation = dict(interval=num_iters_per_epoch * num_epochs)  # only at the end
+
+# Match the 8key sliding-window setup: with_cp=True on the head requires
+# find_unused_parameters=False, otherwise DDP raises "marked ready twice"
+# when the same head param receives gradient from multiple frames in the
+# 8-frame window. The previously-flagged unused param
+# tracklet_former.temporal_embed has been removed entirely (it was dead
+# code, see motip/tracklet.py).
+find_unused_parameters = False
