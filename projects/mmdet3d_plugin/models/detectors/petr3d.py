@@ -605,12 +605,24 @@ class Petr3D(MVXTwoStageDetector):
                     total_predicted += len(gt_ids)
 
         if len(loss_terms) == 0:
-            # Nothing to learn from in this clip; emit a zero loss tensor
-            # that still has a graph dependency on a model parameter so DDP
-            # doesn't complain about unused params.
-            zero = (self.id_dict.embeddings.weight.sum() * 0.0).to(device)
+            # No MOTIP learning signal in this clip. Possible causes:
+            #   - every frame had zero GT (very quiet scene)
+            #   - Hungarian matching produced zero positives in every frame
+            #   - matches existed but no (target, context) pair was valid
+            # Emit a zero loss that touches *every* MOTIP submodule's params
+            # so DDP sees the same parameter usage pattern as a normal iter
+            # (otherwise find_unused_parameters=False crashes the next iter
+            # with "Expected to have finished reduction in the prior
+            # iteration"). Multiplying by 0 makes the gradient exactly zero,
+            # so this path is purely a structural no-op.
+            zero_loss = sum(
+                p.sum()
+                for module in (self.id_dict, self.pe_3d,
+                               self.tracklet_former, self.id_decoder)
+                for p in module.parameters()
+            ) * 0.0
             return {
-                'loss_id': zero,
+                'loss_id': zero_loss,
                 'id_acc': torch.zeros((), device=device),
                 'num_matched': torch.zeros((), device=device),
             }
