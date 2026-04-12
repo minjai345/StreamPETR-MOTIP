@@ -448,8 +448,131 @@ StreamPETR/
 
 ---
 
+## Phase 1 학습 결과 (Sliding Window, iter_14064 = 4 epoch)
+
+### Detection (mAP/NDS)
+
+Detector frozen이므로 pretrained와 동일해야 함 → 확인됨.
+
+```
+mAP: 0.449   NDS: 0.546
+```
+
+### Training id_acc
+
+```
+iter   50: 18%
+iter  500: 46%
+iter 1000: 66%
+iter 2500: 75%
+iter 5000: 76%  ← plateau
+iter 7000: 78%
+```
+
+78%에서 plateau. **빠르게 수렴 후 정체 → shortcut 학습 의심.**
+
+### Tracking eval (AMOTA)
+
+2-stage eval pipeline으로 측정 (tools/extract_track_feats.py → tools/eval_tracking.py):
+
+```
+AMOTA:    0.005    ← 사실상 tracking 안 됨
+RECALL:   0.622    ← detection 자체는 잘 됨
+MOTA:     0.015
+IDS:      68,638   ← ID switch 매우 많음 (매 frame 새 ID 할당)
+TP:       15,289
+FP:       235,448
+```
+
+**결론: SparseBEV MOTIP_INTEGRATION_GUIDE.md 섹션 2.1과 동일한 현상.**
+
+> Autoregressive buffer → wandb에서 85~92% id_acc가 나왔지만 eval에서 0%.
+> 원인: buffer feature는 이전 step의 모델로 생성 → distribution mismatch.
+
+StreamPETR의 sliding window (queue_length=8) 학습은 사실상 autoregressive buffer:
+- 매 frame 순차 forward → buffer에 feature 저장 → 다음 frame에서 context로 재사용
+- MOTIP weight 업데이트 후 이전 frame feature와의 distribution mismatch 발생
+- 모델은 "대충 가장 비슷한 feature 매칭"이라는 shortcut 학습
+- Inference에서는 이 shortcut이 동작하지 않아 ID가 매 frame 바뀜
+
+### 원인 분석
+
+| 현상 | 원인 |
+|------|------|
+| id_acc 78% plateau | persistent object의 trivial feature matching으로 달성 |
+| IDS=68K | MOTIP decoder가 진짜 ID matching을 못 배움 |
+| AMOTA=0.005 | shortcut 학습 → inference에서 transfer 실패 |
+| Recall=0.622 | detection 자체는 정상 (detector frozen) |
+
+---
+
+## Step 9: 2-Stage Tracking Eval Pipeline ✅
+
+### Stage 1: Feature 추출 (tools/extract_track_feats.py)
+
+`dist_test`와 동일 경로로 detection + query_feat 추출. DataLoader 사용으로 빠름.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+LD_LIBRARY_PATH=... PYTHONPATH=... \
+python tools/test.py <config> <ckpt> --launcher pytorch --out <output.pkl>
+```
+
+- petr3d.py의 `simple_test_pts`에서 `query_feat`, `bbox_raw`, `cls_scores` 함께 저장
+- 6019 samples, ~7분, ~4.2GB pkl
+
+### Stage 2: Tracking + Eval (tools/eval_tracking.py)
+
+pkl을 읽어서 MOTIPTracker 실행 → nuScenes submission JSON 생성 → TrackingEval.
+
+```bash
+python tools/eval_tracking.py \
+  --config <config> --checkpoint <ckpt> --feats <pkl> \
+  --det-thresh 0.05 --new-thresh 0.1 --id-thresh 0.1
+```
+
+- Tracker: ~10분 (150 scenes)
+- Eval: ~4분
+- 좌표 변환: SparseBEV val_tracking.py의 `lidar_to_global` 이식 (gravity center 직접 변환)
+
+### Visualization (tools/viz_tracking_cam.py)
+
+6개 카메라 뷰에 3D tracking box를 projection한 mp4 생성.
+
+```bash
+python tools/viz_tracking_cam.py \
+  --submission <tracking_results.json> --scene scene-0003
+```
+
+### 주요 디버깅 기록
+
+1. **data_infos 순서 mismatch**: `val.pkl`의 infos 순서와 `dataset.data_infos` 순서가 다름. DataLoader는 dataset 순서를 따르므로, pkl의 infos가 아닌 `dataset.data_infos`를 사용해야 함.
+2. **DETR 계열 detection score**: StreamPETR은 score>0.3인 detection이 frame당 2~3개뿐. `det_thresh=0.05`로 낮춰야 함.
+3. **gravity center vs bottom center**: `denormalize_bbox`는 gravity center 반환, `LiDARInstance3DBoxes`는 bottom center 기대. 직접 변환 시 주의.
+
+---
+
+## 다음 단계: Non-autoregressive Clip Training
+
+SparseBEV에서 검증된 해결법과 동일하게, StreamPETR에도 non-autoregressive clip training을 구현해야 함.
+
+핵심 요구사항:
+1. 한 iteration에서 T+1 frames를 모두 detector forward (같은 모델 → distribution mismatch 없음)
+2. Detector는 frozen (no_grad), MOTIP 모듈만 gradient
+3. Context (frames 0..t-1)와 query (frame t)가 같은 forward pass에서 생성
+
+StreamPETR 특이사항:
+- `StreamPETRHead`의 memory propagation이 frame 순서에 의존 → clip 내에서도 순차 forward 필요
+- `prev_exists` flag로 scene boundary 처리
+- `num_propagated=128` propagated query가 MOTIP에 미치는 영향 검토 필요
+
+---
+
 ## 미해결 / 후속 작업
 
-1. **Full eval로 mAP/NDS 재현 검증** — 아직 미실행 (~30~40분 소요, GPU 0,1 동시 사용 시)
-2. **flash-attn 설치** — 본 학습 단계에서 속도/메모리 손해를 줄이려면 시도 가치 있음. PyTorch 2.0의 `scaled_dot_product_attention`으로 attention.py 교체하는 게 안전한 대안.
-3. **CPU contention** — 다른 사용자의 학습 프로세스로 시스템 load average 50+. 우리는 GPU 0,1만 사용 + workers_per_gpu 최소화로 매너 유지.
+1. ~~**Full eval로 mAP/NDS 재현 검증**~~ → ✅ mAP=0.449, NDS=0.546 확인
+2. **Non-autoregressive clip training 구현** — Phase 1 shortcut 문제 해결을 위해 필수
+3. **Newborn/existing accuracy 분리 로깅** — shortcut 학습의 정확한 패턴 파악
+4. **Switch augmentation 검증** — context ID만 swap하고 query GT는 그대로 두는 현재 구현이 MOTIP 원본과 일치하는지 확인
+5. **flash-attn 설치** — 학습 속도/메모리 개선
+6. **CPU contention** — 다른 사용자의 학습 프로세스로 시스템 load average 50+. GPU 0,1만 사용 + workers_per_gpu 최소화
