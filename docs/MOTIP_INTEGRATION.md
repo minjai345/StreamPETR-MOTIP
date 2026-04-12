@@ -552,19 +552,58 @@ python tools/viz_tracking_cam.py \
 
 ---
 
-## 다음 단계: Non-autoregressive Clip Training
+## Step 10: Scene Boundary Bug 수정 ✅
 
-SparseBEV에서 검증된 해결법과 동일하게, StreamPETR에도 non-autoregressive clip training을 구현해야 함.
+### 버그 발견
 
-핵심 요구사항:
-1. 한 iteration에서 T+1 frames를 모두 detector forward (같은 모델 → distribution mismatch 없음)
-2. Detector는 frozen (no_grad), MOTIP 모듈만 gradient
-3. Context (frames 0..t-1)와 query (frame t)가 같은 forward pass에서 생성
+Phase 1 학습 결과 분석 중 **AMOTA=0.005, IDS=68K**로 tracking이 사실상 안 되는 문제 확인.
 
-StreamPETR 특이사항:
-- `StreamPETRHead`의 memory propagation이 frame 순서에 의존 → clip 내에서도 순차 forward 필요
-- `prev_exists` flag로 scene boundary 처리
-- `num_propagated=128` propagated query가 MOTIP에 미치는 영향 검토 필요
+Detector frozen이므로 distribution mismatch 가설은 해당 없음. 실제 원인:
+
+**`compute_id_loss`가 scene 경계를 무시하고 다른 scene의 frame을 context에 포함.**
+
+StreamPETR의 sliding window (queue_length=8)는 dataset 순서대로 연속 8 frame을 가져오는데, scene 경계를 넘을 수 있음:
+
+```
+Queue: [SceneA_38, SceneA_39, SceneA_40 | SceneB_1, SceneB_2, SceneB_3, SceneB_4, SceneB_5]
+                                         ↑ prev_exists=0 (scene 전환)
+```
+
+실측: **training sample의 17.4% (4893/28123)에서 scene 경계가 queue에 포함.**
+
+이 경우 `compute_id_loss`가 SceneA의 object ID와 SceneB의 object ID를 같은 clip의 ID re-indexing에 혼합 → garbage label로 학습.
+
+### 수정 내용
+
+**파일**: `projects/mmdet3d_plugin/models/detectors/petr3d.py`, `compute_id_loss`
+
+`prev_exists`를 사용해서 각 batch의 scene 시작점을 찾고, 해당 scene 내의 frame만 사용:
+
+```python
+# scene boundary 탐지
+scene_start = [0] * B
+for b in range(B):
+    for t in range(T):
+        if prev_exists[t][b] == 0:
+            scene_start[b] = t
+
+# ID re-indexing: scene_start 이후 frame만
+scene_frames = [b_matched[t] for t in range(ss, T) if b_matched[t] is not None]
+
+# context 구성: scene_start 이후 frame만
+for t in range(ss + 1, T):
+    for c in range(ss, t):  # ← 이전: range(0, t)
+```
+
+### SparseBEV에서 이 문제가 없었던 이유
+
+SparseBEV는 `DistClipSampler`로 **항상 같은 scene 내의 연속 frame만 샘플링**. Scene 경계가 clip에 절대 포함되지 않음.
+
+---
+
+## 다음 단계
+
+Phase 1을 scene boundary fix 적용 후 재학습하여 tracking 성능 확인.
 
 ---
 

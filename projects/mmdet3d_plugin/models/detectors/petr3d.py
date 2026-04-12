@@ -477,6 +477,19 @@ class Petr3D(MVXTwoStageDetector):
                     'lidar2global': fd['ego_pose'][b],
                 }
 
+        # ── Find scene boundaries per batch using prev_exists ──
+        # scene_start[b] = first frame index of the current scene for batch b.
+        # Frames before scene_start belong to a previous scene and must be
+        # excluded from both ID re-indexing and context building.
+        scene_start = [0] * B
+        for b in range(B):
+            for t in range(T):
+                pe = frame_data_list[t].get('prev_exists')
+                if pe is not None:
+                    val = pe[b] if pe.dim() > 0 else pe
+                    if val.item() == 0:
+                        scene_start[b] = t
+
         # ── Step 2: per-batch ID re-indexing + per-frame loss ──
         loss_terms = []
         total_correct = 0
@@ -485,14 +498,18 @@ class Petr3D(MVXTwoStageDetector):
 
         for b in range(B):
             b_matched = matched[b]
-            non_none = [m for m in b_matched if m is not None]
-            if len(non_none) == 0:
+            ss = scene_start[b]
+
+            # Only use frames from the current scene (>= scene_start)
+            scene_frames = [b_matched[t] for t in range(ss, T)
+                            if b_matched[t] is not None]
+            if len(scene_frames) == 0:
                 continue
 
             # Map raw int IDs to a per-clip 0..n_unique-1 space, then random-
             # permute slot assignments so the model can't memorise slot ↔
             # appearance mappings.
-            all_raw = torch.cat([m['raw_ids'] for m in non_none])
+            all_raw = torch.cat([m['raw_ids'] for m in scene_frames])
             unique_ids, inv_all = all_raw.unique(return_inverse=True)
             n_unique = len(unique_ids)
 
@@ -500,20 +517,18 @@ class Petr3D(MVXTwoStageDetector):
                 perm = torch.randperm(K, device=device)[:n_unique]
                 mapped = perm[inv_all]
             else:
-                # Too many unique objects in this clip — clamp the overflow
-                # into the newborn class. This is rare but possible.
                 mapped = inv_all.clone()
                 mapped[mapped >= K] = K
 
             # Distribute back to per-frame
             offset = 0
-            for m in non_none:
+            for m in scene_frames:
                 n = len(m['raw_ids'])
                 m['mapped_ids'] = mapped[offset:offset + n]
                 offset += n
 
-            # ── For each target frame t (1..T-1), build context from 0..t-1 ──
-            for t in range(1, T):
+            # ── For each target frame t (ss+1..T-1), build context from ss..t-1 ──
+            for t in range(ss + 1, T):
                 cur = b_matched[t]
                 if cur is None:
                     continue
@@ -523,7 +538,7 @@ class Petr3D(MVXTwoStageDetector):
                 ctx_tracklets = []
                 ctx_id_lists = []
 
-                for c in range(t):
+                for c in range(ss, t):
                     ctx = b_matched[c]
                     if ctx is None:
                         continue
