@@ -667,6 +667,11 @@ class Petr3D(MVXTwoStageDetector):
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ]
+        # Attach MOTIP tracking features to results for extraction
+        if self.motip_cfg is not None:
+            bbox_results[0]['query_feat'] = outs['query_feat'][0].cpu()
+            bbox_results[0]['bbox_raw'] = outs['all_bbox_preds'][-1][0].cpu()
+            bbox_results[0]['cls_scores'] = outs['all_cls_scores'][-1][0].cpu()
         return bbox_results
     
     def simple_test(self, img_metas, **data):
