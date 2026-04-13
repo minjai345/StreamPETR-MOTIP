@@ -495,6 +495,10 @@ class Petr3D(MVXTwoStageDetector):
         total_correct = 0
         total_predicted = 0
         total_matched = 0
+        total_correct_nb = 0
+        total_predicted_nb = 0
+        total_correct_ex = 0
+        total_predicted_ex = 0
 
         for b in range(B):
             b_matched = matched[b]
@@ -618,6 +622,13 @@ class Petr3D(MVXTwoStageDetector):
                     preds = id_logits.squeeze(0).argmax(dim=-1)
                     total_correct += (preds == gt_ids).sum().item()
                     total_predicted += len(gt_ids)
+                    # newborn vs existing accuracy
+                    newborn_mask = (gt_ids == K)
+                    existing_mask = ~newborn_mask
+                    total_correct_nb += ((preds == gt_ids) & newborn_mask).sum().item()
+                    total_predicted_nb += newborn_mask.sum().item()
+                    total_correct_ex += ((preds == gt_ids) & existing_mask).sum().item()
+                    total_predicted_ex += existing_mask.sum().item()
 
         if len(loss_terms) == 0:
             # No MOTIP learning signal in this clip. Possible causes:
@@ -643,11 +654,14 @@ class Petr3D(MVXTwoStageDetector):
             }
 
         loss_id = torch.stack(loss_terms).mean() * self.id_loss_weight
-        return {
+        result = {
             'loss_id': loss_id,
             'id_acc': torch.tensor(total_correct / max(total_predicted, 1), device=device),
+            'id_acc_newborn': torch.tensor(total_correct_nb / max(total_predicted_nb, 1), device=device),
+            'id_acc_existing': torch.tensor(total_correct_ex / max(total_predicted_ex, 1), device=device),
             'num_matched': torch.tensor(total_matched / max(len(loss_terms), 1), device=device),
         }
+        return result
 
     def forward_test(self, img_metas, rescale, **data):
         self.test_flag = True
