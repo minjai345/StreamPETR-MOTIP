@@ -1,13 +1,22 @@
 """Stage 2: Run MOTIP tracker on pre-extracted features + nuScenes eval.
 
-Reads pkl from extract_track_feats.py, runs MOTIPTracker per-scene,
-generates submission JSON, runs nuScenes TrackingEval.
+Expects features extracted via the STANDARD mmdet pipeline (NOT
+extract_track_feats.py — that script's output format is incompatible).
 
-Usage:
-    python tools/eval_tracking.py \
-        --config projects/configs/StreamPETR/stream_petr_r50_motip_704_bs1_8key_24e.py \
-        --checkpoint work_dirs/motip_phase1_v1/iter_14064.pth \
-        --feats work_dirs/motip_phase1_v1/track_feats.pkl
+Full eval pipeline (Stage 1 + Stage 2):
+
+    # Stage 1: extract raw 428 features per sample using dist_test.sh
+    CUDA_VISIBLE_DEVICES=<GPU> bash tools/dist_test.sh \
+        <CONFIG> <CKPT> 1 --out <WORK_DIR>/track_feats.pkl
+
+    # Stage 2: run tracker + nuScenes eval
+    CUDA_VISIBLE_DEVICES=<GPU> python tools/eval_tracking.py \
+        --config <CONFIG> --checkpoint <CKPT> \
+        --feats <WORK_DIR>/track_feats.pkl \
+        --det-thresh 0.25 --new-thresh 0.40 --id-thresh 0.10 \
+        --out <WORK_DIR>/tracking_results.json
+
+Best thresholds (from sweep_thresholds tuning): det=0.25 new=0.40 id=0.10.
 """
 import os, sys, json, argparse, pickle, logging
 from collections import defaultdict

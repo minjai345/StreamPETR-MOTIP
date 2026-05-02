@@ -650,6 +650,8 @@ class Petr3D(MVXTwoStageDetector):
             return {
                 'loss_id': zero_loss,
                 'id_acc': torch.zeros((), device=device),
+                'id_acc_newborn': torch.zeros((), device=device),
+                'id_acc_existing': torch.zeros((), device=device),
                 'num_matched': torch.zeros((), device=device),
             }
 
@@ -690,6 +692,9 @@ class Petr3D(MVXTwoStageDetector):
             data['prev_exists'] = data['img'].new_ones(1)
 
         outs = self.pts_bbox_head(location, img_metas, topk_indexes, **data)
+        # Cache outs so extract_track_feats.py can read raw query_feat /
+        # cls_scores / bbox_preds without going through bbox_results.
+        self._test_outs = outs
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas)
         bbox_results = [
