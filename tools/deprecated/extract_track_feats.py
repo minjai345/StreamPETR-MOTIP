@@ -1,13 +1,15 @@
-"""Stage 1: Extract detection outputs + query_feat for tracking eval.
+"""[DEPRECATED — DO NOT USE]
 
-Uses DataLoader with workers for fast image loading.
-Calls model.forward_test() exactly as dist_test does, then reads
-model._test_outs (cached in simple_test_pts) for query_feat.
+Output format is incompatible with tools/eval_tracking.py:
+  - This script: dict[token] of pre-selected top-300 features
+  - eval_tracking.py: list[idx] of {'pts_bbox': {raw 428 features}}
 
-Usage:
-    CUDA_VISIBLE_DEVICES=0 python tools/extract_track_feats.py \
-        --config projects/configs/StreamPETR/stream_petr_r50_motip_704_bs1_8key_24e.py \
-        --checkpoint work_dirs/motip_phase1_v1/iter_14064.pth
+For tracking eval, ALWAYS use the standard mmdet pipeline:
+    bash tools/dist_test.sh <CONFIG> <CKPT> <NUM_GPUS> --out track_feats.pkl
+    python tools/eval_tracking.py --config <CONFIG> --checkpoint <CKPT> \
+        --feats track_feats.pkl --det-thresh 0.25 --new-thresh 0.40 --id-thresh 0.10
+
+Kept for reference only.
 """
 import os, sys, time, argparse, pickle
 import torch
